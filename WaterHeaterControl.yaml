@@ -276,10 +276,13 @@ sensor:
                 r = 1.00f; g = 0.00f; b = 0.00f;
               }
 
-              auto call = id(status_led).turn_on();
-              call.set_rgb(r, g, b);
-              call.set_brightness(0.5f);
-              call.perform();
+              // Only update if the LED is currently on -- respect manual off from HA
+              if (id(status_led).current_values.is_on()) {
+                auto call = id(status_led).turn_on();
+                call.set_rgb(r, g, b);
+                call.set_brightness(0.5f);
+                call.perform();
+              }
     internal_temperature:
       name: "KMeter Internal Temperature"
       unit_of_measurement: "F"
