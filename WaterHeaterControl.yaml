@@ -1,0 +1,343 @@
+################################################################################
+# ESPHome Configuration: Water Heater Controller
+# Hardware:
+#   - M5Stack AtomS3 Lite (ESP32-S3)
+#   - Atomic Port ABC expansion base
+#
+# Pin Reference:
+#   AtomS3 Lite Port C (HY2.0-4P, built-in) -- I2C Bus 0:
+#     G5  = SDA  <- Unit VMeter (ADS1115 @ 0x49, EEPROM @ 0x53)
+#     G6  = SCL
+#
+#   PortABC Port A (yellow=SDA, white=SCL) -- I2C Bus 1:
+#     GPIO38 = SDA  <- Unit KMeter-ISO (@ 0x66)
+#     GPIO39 = SCL
+#
+#   PortABC Port B (GPIO):
+#     GPIO7  = signal pin  <- Unit Relay
+#
+#   Onboard:
+#     GPIO35 = RGB LED (WS2812)
+#     GPIO41 = Button
+#
+# LED: Blackbody-style color scale driven by water temperature.
+#   <= 60F  = Blue       (cold / standby)
+#     90F   = Yellow     (warming up)
+#    110F   = Orange
+#   >= 130F = Red        (at or above target temp)
+################################################################################
+
+esphome:
+  name: water-heater-controller
+  friendly_name: Water Heater Controller
+  comment: "AtomS3 Lite - Water Heater Monitor & Control"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+  id: logger_component
+  level: INFO   # default level on boot
+
+################################################################################
+# Log Level selector -- appears as a dropdown in the HA Controls section.
+# Changing it takes effect immediately without reflashing.
+################################################################################
+select:
+  - platform: template
+    name: "Log Level"
+    icon: "mdi:math-log"
+    id: log_level_select
+    options:
+      - "NONE"
+      - "ERROR"
+      - "WARN"
+      - "INFO"
+      - "DEBUG"
+      - "VERBOSE"
+    initial_option: "INFO"
+    restore_value: false
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            if (x == "NONE")         { id(logger_component).set_log_level(ESPHOME_LOG_LEVEL_NONE); }
+            else if (x == "ERROR")   { id(logger_component).set_log_level(ESPHOME_LOG_LEVEL_ERROR); }
+            else if (x == "WARN")    { id(logger_component).set_log_level(ESPHOME_LOG_LEVEL_WARN); }
+            else if (x == "INFO")    { id(logger_component).set_log_level(ESPHOME_LOG_LEVEL_INFO); }
+            else if (x == "DEBUG")   { id(logger_component).set_log_level(ESPHOME_LOG_LEVEL_DEBUG); }
+            else if (x == "VERBOSE") { id(logger_component).set_log_level(ESPHOME_LOG_LEVEL_VERBOSE); }
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+################################################################################
+# I2C Bus 0 -- AtomS3 Lite Port C (G5=SDA, G6=SCL)
+# Hosts: VMeter ADS1115 (0x49) and VMeter EEPROM (0x53)
+#
+# I2C Bus 1 -- PortABC Port A (GPIO38=SDA, GPIO39=SCL)
+# Hosts: KMeter-ISO (0x66)
+################################################################################
+i2c:
+  - id: i2c_portc
+    sda: GPIO5
+    scl: GPIO6
+    scan: true
+    frequency: 100000
+  - id: i2c_portabc
+    sda: GPIO38
+    scl: GPIO39
+    scan: true
+    frequency: 100000
+
+################################################################################
+# Status LED -- onboard WS2812 on GPIO35
+# Color is driven entirely by water temperature via on_value below.
+# Also visible in HA so you can override or turn it off manually.
+################################################################################
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    name: "Status LED"
+    pin: GPIO35
+    num_leds: 1
+    rmt_symbols: 48
+    chipset: WS2812
+    rgb_order: GRB
+    default_transition_length: 500ms
+
+################################################################################
+# VMeter -- ADS1115 @ 0x49 on I2C Bus 0
+################################################################################
+ads1115:
+  - id: vmeter_adc
+    address: 0x49
+    i2c_id: i2c_portc
+
+i2c_device:
+  id: vmeter_eeprom
+  address: 0x53
+  i2c_id: i2c_portc
+
+sensor:
+  # Raw ADS1115 reading -- internal, not sent to HA
+  - platform: ads1115
+    ads1115_id: vmeter_adc
+    multiplexer: "A0_A1"
+    gain: 1.024
+    sample_rate: 128
+    name: "VMeter Raw Differential"
+    id: vmeter_raw_diff
+    update_interval: 2s
+    internal: true
+    filters:
+      - delta: 0.001    # only propagate if value changed by more than 1mV
+
+  # Calibrated voltage using M5Stack factory EEPROM coefficients
+  - platform: template
+    name: "Water Heater Voltage"
+    id: water_heater_voltage
+    unit_of_measurement: "V"
+    icon: "mdi:flash"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    filters:
+      - delta: 0.05     # only log/report if voltage changed by >= 0.05V
+    lambda: |-
+      float d = id(vmeter_raw_diff).state;
+      if (isnan(d)) return NAN;
+
+      const float PRESSURE_COEFF = 0.015918958f;
+      const uint8_t EEPROM_REG = 0xE8;
+      uint8_t calib[8];
+      uint16_t hope, actual;
+
+      if (id(vmeter_eeprom).read_register(EEPROM_REG, calib, 8) != i2c::ERROR_OK) {
+        ESP_LOGW("vmeter.sensor", "Failed to read from EEPROM");
+        return NAN;
+      }
+
+      uint8_t xor_result = 0x00;
+      for (uint8_t i = 0; i < 5; i++) { xor_result ^= calib[i]; }
+      if (xor_result != calib[5]) {
+        ESP_LOGW("vmeter.sensor", "EEPROM checksum mismatch");
+        return NAN;
+      }
+
+      hope   = (calib[1] << 8) | calib[2];
+      actual = (calib[3] << 8) | calib[4];
+      float calibration_ratio = (float)hope / actual;
+      float vin = (-d / PRESSURE_COEFF) * calibration_ratio;
+      return vin;
+
+  # KMeter-ISO water temperature -- drives the LED color via on_value
+  - platform: kmeteriso
+    i2c_id: i2c_portabc
+    temperature:
+      name: "Water Temperature"
+      id: water_temp_f
+      unit_of_measurement: "F"
+      filters:
+        - lambda: return x * 9.0 / 5.0 + 32.0;
+      icon: "mdi:thermometer-water"
+      device_class: temperature
+      state_class: measurement
+      accuracy_decimals: 1
+      on_value:
+        then:
+          - lambda: |-
+              // Blackbody-style color scale in Fahrenheit.
+              // No purple or pink -- transitions through white near the midpoint.
+              //
+              // Anchor points (temp -> RGB 0.0-1.0):
+              //   60F  = Blue          (0.00, 0.00, 1.00)
+              //   75F  = Blue-white    (0.70, 0.70, 1.00)  all channels rising
+              //   85F  = Warm white    (1.00, 0.90, 0.60)  red leads, blue fading
+              //   95F  = Warm yellow   (1.00, 0.85, 0.00)  blue gone
+              //  105F  = Yellow-orange (1.00, 0.65, 0.00)
+              //  115F  = Orange        (1.00, 0.40, 0.00)
+              //  125F  = Deep orange   (1.00, 0.15, 0.00)
+              //  130F+ = Red           (1.00, 0.00, 0.00)
+              //
+              // pct = position within the current segment (0.0 at start, 1.0 at end).
+              // r/g/b are linearly interpolated between the segment endpoints.
+              float t = x;
+              float r, g, b;
+
+              if (t <= 60.0f) {
+                // Pure blue
+                r = 0.00f; g = 0.00f; b = 1.00f;
+
+              } else if (t <= 75.0f) {
+                // Blue -> Blue-white: all channels rise together
+                // Red and green ramp up to meet blue, giving a cool white
+                float pct = (t - 60.0f) / 15.0f;
+                r = 0.00f + pct * 0.70f;   // 0.00 -> 0.70
+                g = 0.00f + pct * 0.70f;   // 0.00 -> 0.70
+                b = 1.00f;                  // stays at 1.0
+
+              } else if (t <= 85.0f) {
+                // Blue-white -> Warm white: red leads, green holds, blue fades
+                float pct = (t - 75.0f) / 10.0f;
+                r = 0.70f + pct * 0.30f;   // 0.70 -> 1.00
+                g = 0.70f + pct * 0.20f;   // 0.70 -> 0.90
+                b = 1.00f - pct * 0.40f;   // 1.00 -> 0.60
+
+              } else if (t <= 95.0f) {
+                // Warm white -> Warm yellow: blue fades to zero
+                float pct = (t - 85.0f) / 10.0f;
+                r = 1.00f;
+                g = 0.90f - pct * 0.05f;   // 0.90 -> 0.85
+                b = 0.60f - pct * 0.60f;   // 0.60 -> 0.00
+
+              } else if (t <= 105.0f) {
+                // Warm yellow -> Yellow-orange: green drops
+                float pct = (t - 95.0f) / 10.0f;
+                r = 1.00f;
+                g = 0.85f - pct * 0.20f;   // 0.85 -> 0.65
+                b = 0.00f;
+
+              } else if (t <= 115.0f) {
+                // Yellow-orange -> Orange
+                float pct = (t - 105.0f) / 10.0f;
+                r = 1.00f;
+                g = 0.65f - pct * 0.25f;   // 0.65 -> 0.40
+                b = 0.00f;
+
+              } else if (t <= 125.0f) {
+                // Orange -> Deep orange
+                float pct = (t - 115.0f) / 10.0f;
+                r = 1.00f;
+                g = 0.40f - pct * 0.25f;   // 0.40 -> 0.15
+                b = 0.00f;
+
+              } else if (t <= 130.0f) {
+                // Deep orange -> Red
+                float pct = (t - 125.0f) / 5.0f;
+                r = 1.00f;
+                g = 0.15f - pct * 0.15f;   // 0.15 -> 0.00
+                b = 0.00f;
+
+              } else {
+                // Pure red
+                r = 1.00f; g = 0.00f; b = 0.00f;
+              }
+
+              auto call = id(status_led).turn_on();
+              call.set_rgb(r, g, b);
+              call.set_brightness(0.5f);
+              call.perform();
+    internal_temperature:
+      name: "KMeter Internal Temperature"
+      unit_of_measurement: "F"
+      filters:
+        - lambda: return x * 9.0 / 5.0 + 32.0;
+      icon: "mdi:thermometer"
+      device_class: temperature
+      state_class: measurement
+      accuracy_decimals: 1
+    update_interval: 10s
+
+################################################################################
+# Water Heater Element Active -- binary sensor derived from VMeter voltage
+# >10V = ON, <8V = OFF, 8-10V = hold previous state (hysteresis)
+################################################################################
+binary_sensor:
+  - platform: template
+    name: "Water Heater Element Active"
+    id: heater_element_active
+    device_class: running
+    icon: "mdi:water-boiler"
+    lambda: |-
+      float v = id(water_heater_voltage).state;
+      if (isnan(v)) return {};
+      if (v > 10.0) return true;
+      if (v < 8.0)  return false;
+      return {};
+    filters:
+      - delayed_on: 5s
+      - delayed_off: 5s
+
+  # Onboard button -- toggles relay
+  - platform: gpio
+    name: "Manual Button"
+    id: manual_button
+    pin:
+      number: GPIO41
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - switch.toggle: water_heater_relay
+
+################################################################################
+# Unit Relay -- PortABC Port B, GPIO7
+################################################################################
+switch:
+  - platform: gpio
+    name: "Water Heater Relay"
+    id: water_heater_relay
+    pin:
+      number: GPIO7
+      mode: OUTPUT
+      inverted: true    # GPIO floats HIGH during boot; inverted keeps relay OFF during that window
+    icon: "mdi:electric-switch"
+    restore_mode: RESTORE_DEFAULT_OFF
