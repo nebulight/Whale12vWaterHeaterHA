@@ -1,0 +1,70 @@
+  {% set gallons = 3 %}
+  {% set target  = 130 %}
+  {% set watts   = 300 %}
+  {% set eff     = 0.85 %}
+
+  {% set current    = states('sensor.water_heater_controller_water_temperature') | float(0) | round(1) %}
+  {% set element_on = is_state('binary_sensor.water_heater_controller_water_heater_element_active', 'on') %}
+  {% set relay_on   = is_state('switch.water_heater_controller_water_heater_relay', 'on') %}
+
+  {% set lbs  = gallons * 8.34 %}
+  {% set delta = [target - current, 0] | max %}
+  {% set wh   = lbs * delta * 0.29307 %}
+  {% set mins = ((wh / (watts * eff)) * 60) | round(0) | int %}
+  {% set hrs  = (mins / 60) | int %}
+  {% set rem  = mins % 60 %}
+
+  {% if mins >= 60 %}
+    {% set time_str = hrs | string + ' hr ' + rem | string + ' min' %}
+  {% elif mins > 0 %}
+    {% set time_str = mins | string + ' min' %}
+  {% else %}
+    {% set time_str = 'Ready now' %}
+  {% endif %}
+
+  {% set total_delta = [target - 60, 0] | max %}
+  {% set pct        = ((([total_delta - delta, 0] | max) / total_delta * 100) | round(0) | int) if total_delta > 0 else 0 %}
+  {% set bar_filled = (pct / 10) | round(0) | int %}
+  {% set bar_empty  = 10 - bar_filled %}
+
+  {% if element_on %}
+  ## 🔴 Time remaining
+  {% elif relay_on %}
+  ## 🔵 Time needed
+  {% else %}
+  ## Time required to heat water
+  {% endif %}
+
+  **{{ time_str }}** to reach {{ target }}°F
+
+  {% if element_on %}
+  *Element active — heating in progress*
+
+  `{{ '█' * bar_filled }}{{ '░' * bar_empty }}` {{ pct }}%
+
+  {% endif %}
+
+  <hr>
+
+  <div style="display:flex;flex-direction:column;gap:6px;font-size:0.95em;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="color:var(--secondary-text-color);">Current temp</span>
+      <span><strong>{{ current }}°F</strong></span>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="color:var(--secondary-text-color);">Target temp</span>
+      <span><strong>{{ target }}°F</strong></span>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="color:var(--secondary-text-color);">Volume</span>
+      <span><strong>{{ gallons }} gal</strong></span>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="color:var(--secondary-text-color);">Element</span>
+      <span><strong>{{ '🔴 Active' if element_on else 'Off' }}</strong></span>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="color:var(--secondary-text-color);">Relay</span>
+      <span><strong>{{ '🔵 On' if relay_on else 'Off' }}</strong></span>
+    </div>
+  </div>
